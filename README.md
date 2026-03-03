@@ -10,7 +10,7 @@
 ****
 
 <div align="center">
-    <img src='./assets/Schematic_of_LineMut_pipeline_for_GitHub.png' width=600> 
+    <img src='./assets/Schematic_of_LineMut_pipeline_for_GitHub.png' width=1000> 
 </div>
 
 ## Install
@@ -88,4 +88,5 @@ linemut_call [OPTIONS]
 ## Tutorial
 
 Refer to the [linemut-tutorial](https://ruiyingchenbioinfo.github.io/LineMut_tutorialv0.1.0/) page for more detailed information.
+
 
