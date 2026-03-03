@@ -1,23 +1,23 @@
 <div align="center">
     <h1>
-    Welcome to LineMut <img src="./assets/Hi.gif" width="40px">
+    Welcome to LineMut!
     </h1>
     <p>
-     an open-source pipeline for high resolution and stable SNV detection and accurate lineage construction
+     LineMut is an open-source pipeline for high resolution and stable SNV detection and accurate lineage reconstruction.
     </p>
 </div>
 
 ****
 
 <div align="center">
-    <img src='./assets/main_flow.png' width=600> 
+    <img src='./assets/Schematic_of_LineMut_pipeline_for_GitHub.png' width=600> 
 </div>
 
 ## Install
 To use LineMut, first clone this code repository:  
 
 ``` bash 
-git clone https://github.com/Topigs/linemut.git
+git clone https://github.com/RuiyingChenBioinfo/LineMut_v0.1.0.git
 ```
 
 Create a conda environment that contains the dependencies required to run LineMut.  
@@ -88,3 +88,4 @@ linemut_call [OPTIONS]
 ## Tutorial
 
 Refer to the [linemut-tutorial](https://ruiyingchenbioinfo.github.io/LineMut_tutorialv0.1.0/) page for more detailed information.
+
