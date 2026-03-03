@@ -3,7 +3,7 @@
     Welcome to LineMut!
     </h1>
     <p>
-     LineMut is an open-source pipeline for high resolution and stable SNV detection and accurate lineage reconstruction.
+     LineMut is an open-source pipeline for high resolution and stable SNV detection, as well as accurate lineage reconstruction.
     </p>
 </div>
 
@@ -85,8 +85,9 @@ linemut_call [OPTIONS]
     Print this message, exit and return a non-zero exit status.
 ```
 
-## Tutorial
+## Tutorials
 
 Refer to the [linemut-tutorial](https://ruiyingchenbioinfo.github.io/LineMut_tutorialv0.1.0/) page for more detailed information.
+
 
 
