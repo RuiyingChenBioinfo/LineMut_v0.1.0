@@ -87,4 +87,4 @@ linemut_call [OPTIONS]
 
 ## Tutorial
 
-Refer to the [linemut-tutorial](https://linemut-tutorial.readthedocs.io/en/latest/) page for more detailed information.
+Refer to the [linemut-tutorial](https://ruiyingchenbioinfo.github.io/LineMut_tutorialv0.1.0/) page for more detailed information.

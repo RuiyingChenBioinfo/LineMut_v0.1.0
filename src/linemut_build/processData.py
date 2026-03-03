@@ -732,10 +732,12 @@ def ternary_cmb_snv(
     label_jitter=0.008,
     random_state=0,
     minmax_each=False,
+    write_minmax_cols=False,
     group_colors=None,
     color_by=None,
     fallback_cmap="tab20",
     rank_obs_name="cmb_snv_ratio_rank",
+    rank_score_obs_name="cmb_snv_ratio_rank_score",
     rank_tie_method="mergesort",
     figsize=(7, 7),
     savepath=None,
@@ -783,17 +785,33 @@ def ternary_cmb_snv(
 
     eps = 1e-12
     denom = np.maximum(present_count, eps)
-    p_rare = rare_count / denom
-    p_mid = mid_count / denom
-    p_common = common_count / denom
+    p_rare_raw = rare_count / denom
+    p_mid_raw = mid_count / denom
+    p_common_raw = common_count / denom
 
-    s = p_rare + p_mid + p_common
+    s = p_rare_raw + p_mid_raw + p_common_raw
     ok = s > 0
-    p_rare[ok] = p_rare[ok] / s[ok]
-    p_mid[ok] = p_mid[ok] / s[ok]
-    p_common[ok] = p_common[ok] / s[ok]
+    p_rare_raw[ok] = p_rare_raw[ok] / s[ok]
+    p_mid_raw[ok] = p_mid_raw[ok] / s[ok]
+    p_common_raw[ok] = p_common_raw[ok] / s[ok]
 
-    if minmax_each:
+    adata.obs[p_rare_obs] = p_rare_raw
+    adata.obs[p_mid_obs] = p_mid_raw
+    adata.obs[p_common_obs] = p_common_raw
+
+    score_raw = p_common_raw - p_rare_raw
+    adata.obs[rank_score_obs_name] = score_raw
+
+    order = np.argsort(-score_raw, kind=str(rank_tie_method))
+    ranks = np.empty(n, dtype=int)
+    ranks[order] = np.arange(1, n + 1)
+    adata.obs[rank_obs_name] = ranks
+
+    p_rare_plot = p_rare_raw
+    p_mid_plot = p_mid_raw
+    p_common_plot = p_common_raw
+
+    if minmax_each or write_minmax_cols:
         def _minmax(a):
             a2 = a.copy()
             lo = np.nanmin(a2)
@@ -802,9 +820,10 @@ def ternary_cmb_snv(
                 return np.zeros_like(a2)
             return (a2 - lo) / (hi - lo)
 
-        a = _minmax(p_rare)
-        b = _minmax(p_mid)
-        c = _minmax(p_common)
+        a = _minmax(p_rare_raw)
+        b = _minmax(p_mid_raw)
+        c = _minmax(p_common_raw)
+
         ss = a + b + c
         nz = ss > 0
         a[nz] = a[nz] / ss[nz]
@@ -813,21 +832,18 @@ def ternary_cmb_snv(
         a[~nz] = 1.0 / 3.0
         b[~nz] = 1.0 / 3.0
         c[~nz] = 1.0 / 3.0
-        p_rare, p_mid, p_common = a, b, c
 
-    adata.obs[p_rare_obs] = p_rare
-    adata.obs[p_mid_obs] = p_mid
-    adata.obs[p_common_obs] = p_common
+        if write_minmax_cols:
+            adata.obs[f"{p_rare_obs}_minmax"] = a
+            adata.obs[f"{p_mid_obs}_minmax"] = b
+            adata.obs[f"{p_common_obs}_minmax"] = c
 
-    score = p_common - p_rare
-    order = np.argsort(-score, kind=str(rank_tie_method))
-    ranks = np.empty(n, dtype=int)
-    ranks[order] = np.arange(1, n + 1)
-    adata.obs[rank_obs_name] = ranks
+        if minmax_each:
+            p_rare_plot, p_mid_plot, p_common_plot = a, b, c
 
     h = np.sqrt(3) / 2.0
-    xs = 0.5 * p_rare + p_mid
-    ys = h * p_rare
+    xs = 0.5 * p_rare_plot + p_mid_plot
+    ys = h * p_rare_plot
 
     if color_by is None:
         group_vals = labels
@@ -878,7 +894,7 @@ def ternary_cmb_snv(
     if title is None:
         title = f"Rare vs Common vs Mid | Rare<= {rare_max_occ}, Mid<= {mid_max_occ}"
         if minmax_each:
-            title += " | minmax_each=True"
+            title += " | minmax_each=True plot only"
     ax.set_title(title)
 
     if show_labels:
@@ -894,8 +910,13 @@ def ternary_cmb_snv(
         texts = []
         for i in keep_idx:
             texts.append(
-                ax.text(xs[i], ys[i], labels[i], fontsize=label_fontsize,
-                        ha="center", va="center", color="#000000", zorder=5)
+                ax.text(
+                    xs[i], ys[i], labels[i],
+                    fontsize=label_fontsize,
+                    ha="center", va="center",
+                    color="#000000",
+                    zorder=5,
+                )
             )
 
         try:

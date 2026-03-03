@@ -201,7 +201,7 @@ def plot_obs_with_cmb_cent(
     cmb_info,
     group_by,
     cmap="viridis",
-    ntop=5,
+    ntop=3,
     size_by_ncells=True,
     cell_alpha=0.3,
     cell_size=30,
@@ -217,45 +217,31 @@ def plot_obs_with_cmb_cent(
     bbox_inches="tight",
     transparent=False,
     show=True,
-    aspect="auto",  
+    aspect="auto",
     show_labels=True,
+    cell_colors_by_obs=False,
 ):
-    
     import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     import os
 
-    if isinstance(coor, np.ndarray):
-        coor = pd.DataFrame(coor, columns=["x", "y"])
-    elif isinstance(coor, pd.DataFrame):
-        coor = coor.rename(columns={coor.columns[0]: "x", coor.columns[1]: "y"})
-    else:
-        raise TypeError("`coor` must be a np.ndarray or pd.DataFrame")
-
-    coor["group"] = cmb_info
-
     def _resolve_group_colors(unique_groups, user_colors, fallback_cmap="tab20"):
-        """Build {group -> color} from None/dict/list/colormap-name."""
         unique_groups = [str(g) for g in unique_groups]
         default_cols = plt.cm.get_cmap(fallback_cmap)(np.linspace(0, 1, len(unique_groups)))
         default_map = dict(zip(unique_groups, default_cols))
-
         if user_colors is None:
             return default_map
-
         if isinstance(user_colors, dict):
             normalized = {str(k): v for k, v in user_colors.items()}
             return {g: normalized.get(g, default_map[g]) for g in unique_groups}
-
         if isinstance(user_colors, (list, tuple, np.ndarray)):
             seq = list(user_colors)
             if len(seq) == 0:
                 return default_map
             colors = [seq[i % len(seq)] for i in range(len(unique_groups))]
             return dict(zip(unique_groups, colors))
-
         if isinstance(user_colors, str):
             try:
                 cm = plt.cm.get_cmap(user_colors)
@@ -263,39 +249,96 @@ def plot_obs_with_cmb_cent(
                 return dict(zip(unique_groups, colors))
             except Exception:
                 return default_map
-
         return default_map
 
     def _infer_numeric(series: pd.Series):
-        """Return (is_numeric, numeric_series_or_none)."""
         s = series
-        
         if pd.api.types.is_numeric_dtype(s):
             return True, pd.to_numeric(s, errors="coerce")
-
         coerced = pd.to_numeric(s, errors="coerce")
         non_na = s.notna()
         if non_na.sum() == 0:
             return False, None
-
         ratio = coerced[non_na].notna().mean()
         if ratio >= 0.90:
             return True, coerced
         return False, None
 
-    unique_groups = coor["group"].astype(str).unique().tolist()
-    unique_groups = sorted(unique_groups)
-    cluster_color_map = _resolve_group_colors(unique_groups, group_colors, fallback_cmap="tab20")
+    def _looks_like_cell_ids(idx):
+        if idx is None or len(idx) == 0:
+            return False
+        try:
+            s = pd.Index(idx).astype(str)
+        except Exception:
+            return False
+        has_letters = s.str.contains(r"[A-Za-z]").mean() > 0.3
+        has_dash = s.str.contains(r"-").mean() > 0.3
+        return bool(has_letters or has_dash)
 
-    if tohighl is not None:
-        if isinstance(tohighl, (list, tuple, set, np.ndarray, pd.Series)):
-            highlight_groups = {str(g) for g in tohighl}
+    def _normalize_coor(coor_in):
+        if isinstance(coor_in, np.ndarray):
+            arr = np.asarray(coor_in)
+            if arr.ndim != 2 or arr.shape[1] < 2:
+                raise ValueError(f"coor ndarray must be (n,>=2); got {arr.shape}")
+            df = pd.DataFrame(arr[:, :2], columns=["x", "y"])
+            if hasattr(adata, "obs_names") and len(adata.obs_names) == len(df):
+                df.index = adata.obs_names.astype(str)
+            return df
+        if isinstance(coor_in, pd.DataFrame):
+            df = coor_in.copy()
+            if not (("x" in df.columns) and ("y" in df.columns)):
+                df = df.rename(columns={df.columns[0]: "x", df.columns[1]: "y"})
+            if "x" not in df.columns or "y" not in df.columns:
+                raise KeyError("coor must have x and y columns")
+            if not _looks_like_cell_ids(df.index) and hasattr(adata, "obs_names") and len(adata.obs_names) == len(df):
+                df = df.copy()
+                df.index = adata.obs_names.astype(str)
+            return df
+        raise TypeError("coor must be a np.ndarray or pd.DataFrame")
+
+    def _cmb_to_series(cmb_in, target_index):
+        if isinstance(cmb_in, pd.Series):
+            s = cmb_in.copy()
+        elif isinstance(cmb_in, pd.DataFrame):
+            if "group" in cmb_in.columns:
+                s = cmb_in["group"].copy()
+                if "cell" in cmb_in.columns and (not _looks_like_cell_ids(s.index)) and _looks_like_cell_ids(cmb_in["cell"].astype(str)):
+                    s.index = cmb_in["cell"].astype(str).to_numpy()
+            elif cmb_in.shape[1] == 1:
+                s = cmb_in.iloc[:, 0].copy()
+                if "cell" in cmb_in.columns and (not _looks_like_cell_ids(s.index)) and _looks_like_cell_ids(cmb_in["cell"].astype(str)):
+                    s.index = cmb_in["cell"].astype(str).to_numpy()
+            else:
+                raise ValueError(f"cmb_info DataFrame must have a 'group' column or be 1-column. Columns={list(cmb_in.columns)}")
         else:
-            highlight_groups = {str(tohighl)}
-        cluster_color_map = {
-            g: cluster_color_map[g] if g in highlight_groups else "#999999"
-            for g in unique_groups
-        }
+            arr = np.asarray(cmb_in)
+            if arr.ndim == 1:
+                s = pd.Series(arr)
+            elif arr.ndim == 2 and arr.shape[1] == 1:
+                s = pd.Series(arr[:, 0])
+            else:
+                raise ValueError(f"cmb_info must be 1D (n,) or (n,1). Got shape {arr.shape}")
+
+        if not _looks_like_cell_ids(s.index):
+            if hasattr(adata, "obs_names") and len(adata.obs_names) == len(s):
+                s.index = adata.obs_names.astype(str)
+            elif len(s) == len(target_index):
+                s.index = pd.Index(target_index).astype(str)
+
+        s.index = pd.Index(s.index).astype(str).str.strip()
+        s = s.astype(str).str.strip()
+        s2 = s.reindex(pd.Index(target_index).astype(str))
+        return s2
+
+    coor = _normalize_coor(coor)
+    coor.index = pd.Index(coor.index).astype(str).str.strip()
+
+    cmb_s = _cmb_to_series(cmb_info, coor.index)
+    if cmb_s.isna().any():
+        n_na = int(cmb_s.isna().sum())
+        print(f"[plot_obs_with_cmb_cent] WARNING: {n_na} cells have no cmb mapping after alignment and will appear gray")
+    coor = coor.copy()
+    coor["group"] = cmb_s.fillna("#__UNMAPPED__#").astype(str)
 
     obs = adata.obs
     if group_by not in obs.columns:
@@ -312,14 +355,11 @@ def plot_obs_with_cmb_cent(
     is_num, gb_num = _infer_numeric(gb_raw)
 
     if is_num:
-
         gb_num = gb_num.astype(float)
         keep = gb_num.notna()
         gb_vals = gb_num[keep].to_numpy()
         mask_idx = gb_num.index[keep]
-        
     else:
-
         gb_cat = gb_raw.astype("object")
         keep = gb_cat.notna()
         gb_vals = gb_cat[keep].astype(str).to_numpy()
@@ -328,8 +368,7 @@ def plot_obs_with_cmb_cent(
     d = obs.loc[mask_idx, required_cols].astype(float)
     x = d["x_center"].to_numpy()
     y = d["y_center"].to_numpy()
-    labels = obs.index.astype(str)
-    labels = labels[obs.index.get_indexer(mask_idx)].to_numpy()
+    labels = mask_idx.astype(str).to_numpy()
 
     if size_by_ncells and len(d):
         sizes = d["n_cells"].clip(lower=1).to_numpy()
@@ -349,20 +388,123 @@ def plot_obs_with_cmb_cent(
     if title is None:
         title = f"Mapping {group_by} on spatial coordinates"
 
+    highlight_groups = None
+    if tohighl is not None:
+        if isinstance(tohighl, (list, tuple, set, np.ndarray, pd.Series)):
+            highlight_groups = {str(g).strip() for g in tohighl}
+        else:
+            highlight_groups = {str(tohighl).strip()}
+
+    vmin = vmax = None
+    center_color_map = None
+    center_point_colors = None
+    center_cats = None
+
+    if len(d) and (not is_num):
+        center_cats = sorted(pd.unique(pd.Series(gb_vals).astype(str)).tolist())
+        center_color_map = _resolve_group_colors(center_cats, center_colors, fallback_cmap="tab20")
+        center_point_colors = [center_color_map[str(v)] for v in gb_vals]
+
+    if len(d) and is_num and len(gb_vals):
+        vmin = float(np.nanmin(gb_vals))
+        vmax = float(np.nanmax(gb_vals))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmin = vmax = None
+
     fig, ax = plt.subplots(figsize=figsize)
-    if show_group_legend:
+
+    adjust_right_for_group_legend = bool(show_group_legend)
+    if cell_colors_by_obs and is_num:
+        adjust_right_for_group_legend = False
+    if cell_colors_by_obs and (not is_num) and show_center_legend:
+        adjust_right_for_group_legend = False
+    if adjust_right_for_group_legend:
         fig.subplots_adjust(right=0.75)
 
-    for cluster in unique_groups:
-        subset = coor[coor["group"].astype(str) == cluster]
-        ax.scatter(
-            subset["x"],
-            subset["y"],
-            c=[cluster_color_map[cluster]],
-            label=cluster,
-            s=cell_size,
-            alpha=cell_alpha,
-        )
+    if not cell_colors_by_obs:
+        unique_groups = sorted(coor["group"].astype(str).unique().tolist())
+        cluster_color_map = _resolve_group_colors(unique_groups, group_colors, fallback_cmap="tab20")
+        if "#__UNMAPPED__#" in unique_groups:
+            cluster_color_map["#__UNMAPPED__#"] = "#999999"
+        if highlight_groups is not None:
+            cluster_color_map = {g: (cluster_color_map[g] if g in highlight_groups else "#999999") for g in unique_groups}
+
+        for cluster in unique_groups:
+            subset = coor[coor["group"].astype(str) == cluster]
+            ax.scatter(
+                subset["x"],
+                subset["y"],
+                c=[cluster_color_map[cluster]],
+                label=cluster,
+                s=cell_size,
+                alpha=cell_alpha,
+                linewidths=0,
+                zorder=1,
+            )
+    else:
+        if len(d) > 0:
+            centerid_to_gb = dict(zip(mask_idx.astype(str).tolist(), gb_vals.tolist()))
+            cell_center = coor["group"].astype(str)
+
+            if highlight_groups is not None:
+                keep_h = cell_center.isin(highlight_groups)
+            else:
+                keep_h = pd.Series(True, index=coor.index)
+
+            if is_num:
+                cell_vals = cell_center.map(centerid_to_gb)
+                cell_vals = pd.to_numeric(cell_vals, errors="coerce").astype(float)
+                cell_vals = cell_vals.where(keep_h, np.nan)
+
+                is_ok = cell_vals.notna() & np.isfinite(cell_vals)
+                is_bad = ~is_ok
+
+                if is_bad.any():
+                    ax.scatter(
+                        coor.loc[is_bad, "x"],
+                        coor.loc[is_bad, "y"],
+                        c="#999999",
+                        s=cell_size,
+                        alpha=cell_alpha,
+                        linewidths=0,
+                        zorder=1,
+                    )
+
+                if is_ok.any():
+                    ax.scatter(
+                        coor.loc[is_ok, "x"],
+                        coor.loc[is_ok, "y"],
+                        c=cell_vals.loc[is_ok].to_numpy(),
+                        cmap=cmap,
+                        vmin=vmin,
+                        vmax=vmax,
+                        s=cell_size,
+                        alpha=cell_alpha,
+                        linewidths=0,
+                        zorder=1,
+                    )
+            else:
+                cell_cat = cell_center.map(centerid_to_gb)
+                cell_cat = cell_cat.where(keep_h, "#__GRAY__#").astype(object)
+
+                def _to_color(v):
+                    if v is None or (isinstance(v, float) and np.isnan(v)):
+                        return "#999999"
+                    if v == "#__GRAY__#":
+                        return "#999999"
+                    return center_color_map.get(str(v), "#999999")
+
+                cell_cols = cell_cat.map(_to_color).to_numpy()
+
+                ax.scatter(
+                    coor["x"],
+                    coor["y"],
+                    c=cell_cols,
+                    s=cell_size,
+                    alpha=cell_alpha,
+                    linewidths=0,
+                    zorder=1,
+                )
 
     if len(d):
         if is_num:
@@ -372,10 +514,13 @@ def plot_obs_with_cmb_cent(
                 s=s,
                 c=gb_vals,
                 cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
                 alpha=0.85,
                 marker="o",
                 edgecolors="k",
                 linewidths=0.6,
+                zorder=5,
             )
             cb = fig.colorbar(sc, ax=ax, pad=0.1, location="left")
             cb.set_label(str(group_by))
@@ -383,13 +528,14 @@ def plot_obs_with_cmb_cent(
             if show_labels:
                 try:
                     from adjustText import adjust_text
+
                     texts_top, texts_oth = [], []
                     for i, (xx, yy, lb, v) in enumerate(zip(x, y, labels, gb_vals)):
                         is_top_and_pos = (i in top_idx) and (not np.isnan(v)) and (v > 0)
                         if is_top_and_pos:
-                            texts_top.append(ax.text(xx, yy, str(lb), fontsize=8, color="black"))
+                            texts_top.append(ax.text(xx, yy, str(lb), fontsize=8, color="black", zorder=6))
                         else:
-                            texts_oth.append(ax.text(xx, yy, str(lb), fontsize=8, color="gray"))
+                            texts_oth.append(ax.text(xx, yy, str(lb), fontsize=8, color="gray", zorder=6))
 
                     if texts_top:
                         adjust_text(
@@ -429,21 +575,7 @@ def plot_obs_with_cmb_cent(
                                 color=color,
                             ),
                         )
-
         else:
-            
-            center_cats = pd.unique(pd.Series(gb_vals))
-            center_cats = [str(c) for c in center_cats.tolist()]
-            center_cats = sorted(center_cats)
-
-            center_color_map = _resolve_group_colors(
-                center_cats,
-                center_colors,
-                fallback_cmap=("tab20" if center_colors is None else "tab20"),
-            )
-
-            center_point_colors = [center_color_map[str(v)] for v in gb_vals]
-
             ax.scatter(
                 x,
                 y,
@@ -453,13 +585,14 @@ def plot_obs_with_cmb_cent(
                 marker="o",
                 edgecolors="k",
                 linewidths=0.6,
+                zorder=5,
             )
 
             if show_labels:
                 try:
                     from adjustText import adjust_text
-                    texts = [ax.text(xx, yy, str(lb), fontsize=8, color="gray")
-                             for xx, yy, lb in zip(x, y, labels)]
+
+                    texts = [ax.text(xx, yy, str(lb), fontsize=8, color="gray", zorder=6) for xx, yy, lb in zip(x, y, labels)]
                     if texts:
                         adjust_text(
                             texts,
@@ -483,9 +616,7 @@ def plot_obs_with_cmb_cent(
                         )
 
             if show_center_legend:
-                center_handles = [
-                    mpatches.Patch(color=center_color_map[c], label=c) for c in center_cats
-                ]
+                center_handles = [mpatches.Patch(color=center_color_map[c], label=c) for c in center_cats]
                 leg2 = ax.legend(
                     handles=center_handles,
                     title=str(group_by),
@@ -494,7 +625,6 @@ def plot_obs_with_cmb_cent(
                     frameon=True,
                 )
                 ax.add_artist(leg2)
-
     else:
         ax.text(
             0.5,
@@ -505,11 +635,14 @@ def plot_obs_with_cmb_cent(
             transform=ax.transAxes,
         )
 
-    if show_group_legend:
-        handles = [
-            mpatches.Patch(color=cluster_color_map[cluster], label=cluster)
-            for cluster in unique_groups
-        ]
+    if show_group_legend and (not cell_colors_by_obs):
+        unique_groups = sorted(coor["group"].astype(str).unique().tolist())
+        cluster_color_map = _resolve_group_colors(unique_groups, group_colors, fallback_cmap="tab20")
+        if "#__UNMAPPED__#" in unique_groups:
+            cluster_color_map["#__UNMAPPED__#"] = "#999999"
+        if highlight_groups is not None:
+            cluster_color_map = {g: (cluster_color_map[g] if g in highlight_groups else "#999999") for g in unique_groups}
+        handles = [mpatches.Patch(color=cluster_color_map[g], label=g) for g in unique_groups if g != "#__UNMAPPED__#"]
         ax.legend(handles=handles, title="Group", bbox_to_anchor=(1, 1), loc="upper left")
 
     ax.set_title(title)
@@ -814,673 +947,6 @@ def plot_snv_with_cmb_cent(
         plt.close(fig)
 
     return fig, ax
-
-def plot_cmb_cent_vector(
-    adata,
-    coor,
-    cell_info,
-    group_colors=None,
-    cell_group_col="group",
-    coor_cell_col=None,
-    show_cells=True,
-    show_vector=True,
-    root_cells=None,
-    end_cells=None,
-    cell_alpha=0.3,
-    cell_size=20,
-    size_by_ncells=True,
-    show_labels=True,
-    show_group_legend=False,
-    figsize=(9,6),
-    aspect="auto",
-    vector_span_frac=0.12,
-    title="CMB centers + vector field",
-    savepath=None,
-    dpi=300,
-    transparent=False,
-    bbox_inches="tight",
-    show=True,
-    plot_conn_graph_by=None,      # None, "Heatmap", or "Network"
-    conn_graph_figsize=(5,5),     # Figure size for the connectivity graph
-    heatmap_sort_labels=True,     # Whether to sort labels alphabetically in heatmap
-    network_edge_alpha=0.96,       # Base alpha for network edges
-    ##network_show_labels=False,    # Whether to show labels in network graph
-):
-   
-    import os
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    from matplotlib.patches import FancyArrowPatch
-    import scipy.sparse as sp
-    from scipy.sparse. csgraph import dijkstra
-
-    if (root_cells is not None) and (end_cells is not None):
-        raise ValueError("root_cells and end_cells cannot both be not None.")
-    if (root_cells is not None) and (not isinstance(root_cells, str)):
-        raise TypeError("root_cells must be a single CMB label (str) or None.")
-    if (end_cells is not None) and (not isinstance(end_cells, str)):
-        raise TypeError("end_cells must be a single CMB label (str) or None.")
-
-    #### Validate plot_conn_graph_by
-    valid_conn_options = {None, "Heatmap", "Network", "heatmap", "network"}
-    if plot_conn_graph_by not in valid_conn_options:
-        raise ValueError(
-            f"plot_conn_graph_by must be None, 'Heatmap', or 'Network', got:  {plot_conn_graph_by}"
-        )
-    # Normalize to capitalized form
-    if plot_conn_graph_by is not None:
-        plot_conn_graph_by = plot_conn_graph_by.capitalize()
-
-    required_cols = ["x_center", "y_center", "n_cells"]
-    missing = [c for c in required_cols if c not in adata.obs.columns]
-    if missing:
-        raise KeyError(f"Missing columns in adata.obs: {missing}. Expected: {required_cols}")
-
-    def _resolve_group_colors(unique_groups, user_colors, fallback_cmap="tab20"):
-        """Build a color map {group -> color} from different user input types."""
-        unique_groups = [str(g).strip() for g in unique_groups]
-        n_groups = max(len(unique_groups), 1)
-        default_cols = plt.cm.get_cmap(fallback_cmap)(np.linspace(0, 1, n_groups))
-        default_map = dict(zip(unique_groups, default_cols))
-
-        if user_colors is None:
-            return default_map
-
-        if isinstance(user_colors, dict):
-            normalized = {str(k).strip(): v for k, v in user_colors.items()}
-            return {g: normalized. get(g, default_map[g]) for g in unique_groups}
-
-        if isinstance(user_colors, (list, tuple, np.ndarray)):
-            seq = list(user_colors)
-            if len(seq) == 0:
-                return default_map
-            colors = [seq[i % len(seq)] for i in range(len(unique_groups))]
-            return dict(zip(unique_groups, colors))
-
-        if isinstance(user_colors, str):
-            try:
-                cm = plt.cm.get_cmap(user_colors)
-                colors = cm(np.linspace(0, 1, len(unique_groups)))
-                return dict(zip(unique_groups, colors))
-            except Exception: 
-                return default_map
-
-        return default_map
-
-    def _coor_to_xy_and_cellids(coor_in):
-        
-        if isinstance(coor_in, np.ndarray):
-            if coor_in.ndim != 2 or coor_in.shape[1] < 2:
-                raise ValueError(f"coor ndarray must be (n,>=2); got {coor_in.shape}")
-            raise ValueError()
-
-        if isinstance(coor_in, pd. DataFrame):
-            df = coor_in. copy()
-            cols_lower = [c.lower() for c in df.columns]
-
-            if "x" in cols_lower and "y" in cols_lower: 
-                xcol = df.columns[cols_lower.index("x")]
-                ycol = df.columns[cols_lower.index("y")]
-                xy = df[[xcol, ycol]]. rename(columns={xcol: "x", ycol: "y"})
-            elif "coor_x" in cols_lower and "coor_y" in cols_lower:
-                xcol = df. columns[cols_lower.index("coor_x")]
-                ycol = df.columns[cols_lower.index("coor_y")]
-                xy = df[[xcol, ycol]]. rename(columns={xcol: "x", ycol: "y"})
-            else:
-                xy = df. iloc[:, :2]. rename(columns={df.columns[0]: "x", df.columns[1]: "y"})
-
-            if coor_cell_col is not None:
-                if coor_cell_col not in df.columns:
-                    raise KeyError(f"coor_cell_col='{coor_cell_col}' not found in coor columns.")
-                cell_ids = df[coor_cell_col].astype(str).str.strip().to_numpy()
-            else:
-                cell_ids = df.index.astype(str).str.strip().to_numpy()
-
-            xy = xy.reset_index(drop=True)
-            return xy, cell_ids
-
-        raise TypeError("coor must be a pandas DataFrame (recommended) or numpy array.")
-
-    def _cellinfo_to_series(cell_info_in):
-
-        if isinstance(cell_info_in, pd.Series):
-            s = cell_info_in.copy()
-        elif isinstance(cell_info_in, pd.DataFrame):
-            if cell_group_col in cell_info_in.columns:
-                s = cell_info_in[cell_group_col].copy()
-            elif cell_info_in.shape[1] == 1:
-                s = cell_info_in.iloc[:, 0].copy()
-            else:
-                raise ValueError(
-                    f"cell_info is a DataFrame but has no '{cell_group_col}' column and "
-                    f"has {cell_info_in.shape[1]} columns; cannot infer group column."
-                )
-        else:
-            raise TypeError("cell_info must be a pandas Series or DataFrame indexed by cell IDs.")
-
-        s. index = s.index.astype(str).str.strip()
-        s = s.astype(str).str.strip()
-        return s
-
-    def _compute_vector_directions(conn_matrix, labels, root_cells_local, end_cells_local):
-
-        n = len(labels)
-        W = conn_matrix. copy()
-
-        label_to_idx = {lb: i for i, lb in enumerate(labels)}
-
-        dist = None
-        if root_cells_local is not None or end_cells_local is not None:
-            target = root_cells_local if root_cells_local is not None else end_cells_local
-            target = str(target).strip()
-
-            if target not in label_to_idx: 
-                return {}  
-
-            target_idx = label_to_idx[target]
-
-            rr, cc = np.where(W > 0)
-            if rr.size == 0:
-                dist = np.full(n, np.inf)
-            else:
-                eps = 1e-12
-                lengths = 1.0 / (W[rr, cc] + eps)
-                G = sp.csr_matrix((lengths, (rr, cc)), shape=(n, n))
-                G = (G + G.T) * 0.5
-                dist = dijkstra(G, directed=False, indices=target_idx)
-
-        edge_directions = {}
-        tol = 1e-12
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                if W[i, j] <= 0:
-                    continue
-
-                if dist is None:
-
-                    edge_directions[(i, j)] = 0
-                else:
-
-                    if not np.isfinite(dist[i]) or not np.isfinite(dist[j]):
-                        edge_directions[(i, j)] = 0
-                    elif root_cells_local is not None: 
-
-                        if dist[j] > dist[i] + tol:
-                            edge_directions[(i, j)] = 1  
-                        elif dist[i] > dist[j] + tol:
-                            edge_directions[(i, j)] = -1  
-                        else:
-                            edge_directions[(i, j)] = 0
-                    else: 
-                        if dist[j] < dist[i] - tol:
-                            edge_directions[(i, j)] = 1  # i -> j
-                        elif dist[i] < dist[j] - tol: 
-                            edge_directions[(i, j)] = -1  # j -> i
-                        else: 
-                            edge_directions[(i, j)] = 0
-
-        return edge_directions
-    ### Heatmap
-    def _plot_connectivity_heatmap(ax, conn_matrix, labels, sort_labels=True):
-
-        from matplotlib.colors import LinearSegmentedColormap
-
-        # Sort labels and reorder matrix if requested
-        if sort_labels: 
-            sorted_indices = np.argsort(labels)
-            sorted_labels = labels[sorted_indices]
-            sorted_conn_matrix = conn_matrix[np.ix_(sorted_indices, sorted_indices)]
-        else:
-            sorted_labels = labels
-            sorted_conn_matrix = conn_matrix
-
-        n = len(sorted_labels)
-        ###ColorSet
-        custom_cmap = LinearSegmentedColormap.from_list(
-            "custom", ["#FFFBDE", "#90D1CA", "#129990", "#096B68"], N=256
-        )
-        im = ax.imshow(sorted_conn_matrix, cmap=custom_cmap, aspect="auto", interpolation="nearest")
-        cbar = plt.colorbar(im, ax=ax, shrink=0.8)
-        cbar.set_label("Connectivity", fontsize=9)
-
-        ax.set_xticks(np.arange(n))
-        ax.set_yticks(np.arange(n))
-        ax.set_xticklabels(sorted_labels, rotation=90, fontsize=7)
-        ax.set_yticklabels(sorted_labels, fontsize=7)
-        ax.tick_params(axis="both", which="both", length=0)
-        ax.grid(False)
-
-        for spine in ax.spines.values():
-            spine.set_visible(True)
-            spine.set_color("gray")
-            spine.set_linewidth(0.5)
-
-        ax.set_xlabel("CMB", fontsize=9)
-        ax.set_ylabel("CMB", fontsize=9)
-        ax.set_title("CMB Connectivity Heatmap", fontsize=10)
-
-    def _plot_connectivity_network(
-        ax, conn_matrix, labels, color_map, node_sizes,
-        edge_directions, base_edge_alpha=0.6, show_labels=False
-    ):
-        n = len(labels)
-        if n == 0:
-            ax.text(0.5, 0.5, "No centers to display", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title("CMB Connectivity Network", fontsize=10)
-            return
-
-        try:
-            import networkx as nx
-
-            G = nx.Graph()
-            G.add_nodes_from(range(n))
-
-            for i in range(n):
-                for j in range(i + 1, n):
-                    w = conn_matrix[i, j]
-                    if w > 0:
-                        G.add_edge(i, j, weight=w)
-
-            if G.number_of_edges() > 0:
-                pos = nx.spring_layout(
-                    G,
-                    k=2.0 / np.sqrt(n) if n > 1 else 1.0,
-                    iterations=100,
-                    weight="weight",
-                    seed=42
-                )
-            else:
-                pos = nx.circular_layout(G)
-
-        except ImportError:
-            print("[plot_cmb_cent_vector] WARNING: networkx not installed.  Using circular layout.")
-            angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
-            pos = {i: (np. cos(angles[i]), np.sin(angles[i])) for i in range(n)}
-
-        positions = np.array([pos[i] for i in range(n)])
-
-        conn_flat = conn_matrix[np.triu_indices(n, k=1)]
-        if len(conn_flat) > 0 and conn_flat.max() > 0:
-            max_conn = conn_flat.max()
-            min_conn = conn_flat[conn_flat > 0].min() if np.any(conn_flat > 0) else 0
-        else:
-            max_conn = 1
-            min_conn = 0
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                w = conn_matrix[i,j]
-                if w <= 0:
-                    continue
-
-                if max_conn > min_conn:
-                    norm_w = (w - min_conn) / (max_conn - min_conn)
-                else:
-                    norm_w = 0.5
-
-                line_width = 0.8 + 3.5 * norm_w
-                alpha = base_edge_alpha * (0.4 + 0.6 * norm_w)
-
-                direction = edge_directions.get((i,j), 0)
-
-                pos_i = positions[i]
-                pos_j = positions[j]
-
-                if direction == 0:
-                    
-                    ax.plot(
-                        [pos_i[0], pos_j[0]],
-                        [pos_i[1], pos_j[1]],
-                        color="#555555",
-                        linewidth=line_width,
-                        alpha=alpha,
-                        zorder=1,
-                    )
-                else:
-
-                    if direction == 1:
- 
-                        start, end = pos_i, pos_j
-                        start_idx, end_idx = i, j
-                    else: 
-
-                        start, end = pos_j, pos_i
-                        start_idx, end_idx = j, i
-
-                    shrink_start = np.sqrt(node_sizes[start_idx]) * 0.015
-                    shrink_end = np.sqrt(node_sizes[end_idx]) * 0.015
-
-                    arrow = FancyArrowPatch(
-                        posA=start,
-                        posB=end,
-                        arrowstyle="-|>",
-                        mutation_scale=8 + 6 * norm_w,
-                        color="#555555",
-                        linewidth=line_width,
-                        alpha=alpha,
-                        shrinkA=shrink_start * 50,
-                        shrinkB=shrink_end * 50,
-                        zorder=1,
-                    )
-                    ax.add_patch(arrow)
-
-        node_colors = [color_map. get(str(labels[i]).strip(), "#444444") for i in range(n)]
-
-        # Scale node sizes for network plot
-        if node_sizes. max() > 0:
-            scaled_sizes = 100 + 400 * (node_sizes / node_sizes. max())
-        else:
-            scaled_sizes = np.full(n,300)
-
-        # Draw nodes
-        ax.scatter(
-            positions[:, 0],
-            positions[:, 1],
-            s=scaled_sizes,
-            c=node_colors,
-            alpha=0.95,
-            marker="o",
-            edgecolors="k",
-            linewidths=0.8,
-            zorder=5,
-        )
-
-        if show_labels:
-            for i, lb in enumerate(labels):
-                ax.annotate(
-                    str(lb),
-                    xy=(positions[i, 0], positions[i,1]),
-                    xytext=(5,5),
-                    textcoords="offset points",
-                    fontsize=8,
-                    color="black",
-                    zorder=6,
-                )
-
-        padding = 0.15
-        x_range = positions[:, 0].max() - positions[:, 0].min()
-        y_range = positions[:, 1].max() - positions[:, 1].min()
-        ax.set_xlim(
-            positions[:, 0].min() - padding * max(x_range, 0.5),
-            positions[:, 0].max() + padding * max(x_range, 0.5)
-        )
-        ax.set_ylim(
-            positions[: , 1].min() - padding * max(y_range, 0.5),
-            positions[: , 1].max() + padding * max(y_range, 0.5)
-        )
-        ax.set_aspect("equal")
-        ax.axis("off")
-        ax.set_title("CMB Connectivity Network", fontsize=10)
-
-    # ======================== DATA PREPARATION ========================
-    xy_cells, cell_ids = _coor_to_xy_and_cellids(coor)
-    group_series = _cellinfo_to_series(cell_info)
-
-    groups = group_series.reindex(cell_ids)
-    unmapped_mask = groups.isna()
-    if int(unmapped_mask.sum()) > 0:
-        print(
-            f"[plot_cmb_cent_vector] WARNING: {int(unmapped_mask.sum())} cells in coor could not be found "
-            f"in cell_info index. They will be colored '#999999'."
-        )
-    groups = groups.fillna("#UNMAPPED#").astype(str)
-
-    cell_df = xy_cells.copy()
-    cell_df["group"] = groups. to_numpy()
-
-    unique_groups = sorted(pd.unique(cell_df["group"]).tolist())
-    cluster_color_map = _resolve_group_colors(unique_groups, group_colors, fallback_cmap="tab20")
-    cluster_color_map["#UNMAPPED#"] = "#999999"
-
-    if isinstance(group_colors, dict):
-        norm_keys = {str(k).strip() for k in group_colors.keys()}
-        missing_keys = [g for g in unique_groups if (g not in norm_keys) and (g != "#UNMAPPED#")]
-        if len(missing_keys) > 0:
-            print(
-                f"[plot_cmb_cent_vector] WARNING: {len(missing_keys)} groups not found in group_colors; "
-                f"they will fall back to tab20. Examples:  {missing_keys[: 30]}"
-            )
-
-    obs = adata.obs.copy()
-    mask = obs[required_cols].notna().all(axis=1)
-    obs2 = obs. loc[mask, required_cols]. astype(float)
-
-    center_labels = adata.obs_names[mask]. astype(str).str.strip().to_numpy()
-    x_cent = obs2["x_center"].to_numpy()
-    y_cent = obs2["y_center"]. to_numpy()
-    n_cells_cent = obs2["n_cells"].to_numpy()
-    centers_xy = np.column_stack([x_cent, y_cent])
-    n_cent = len(center_labels)
-
-    if size_by_ncells and n_cent > 0:
-        sizes = np.clip(n_cells_cent, 1, None)
-        denom = np.sqrt(sizes. max()) if sizes.max() > 0 else 1.0
-        s_cent = 20 + 180 * (np.sqrt(sizes) / denom)
-    else:
-        s_cent = np.full(n_cent, 160.0, dtype=float)
-
-    center_color_map = _resolve_group_colors(
-        sorted(set(center_labels. tolist())), group_colors, fallback_cmap="tab20"
-    )
-    center_colors = [center_color_map. get(lb, "#444444") for lb in center_labels]
-
-    # ======================== CONNECTIVITY MATRIX ========================
-    conn_matrix = None
-    idx_cent = None
-
-    if show_vector or plot_conn_graph_by is not None:
-        if "joint_connectivities" in adata.obsp: 
-            A = adata.obsp["joint_connectivities"]
-        elif "joint" in adata.uns and "connectivities_key" in adata.uns["joint"]:
-            A = adata.obsp[adata.uns["joint"]["connectivities_key"]]
-        else:
-            raise KeyError("Cannot find joint connectivities in adata.obsp['joint_connectivities'].")
-
-        if not sp.issparse(A):
-            A = sp.csr_matrix(A)
-        A = A.tocsr()
-
-        idx_cent = np.where(mask. to_numpy() if hasattr(mask, "to_numpy") else np.asarray(mask))[0]
-        A = A[idx_cent][:, idx_cent]
-
-        if A.shape != (n_cent, n_cent):
-            raise ValueError(
-                f"joint_connectivities shape {A.shape} must match centers count ({n_cent},{n_cent})."
-            )
-
-        A = (A + A.T) * 0.5
-        A. setdiag(0.0)
-        A. eliminate_zeros()
-
-        conn_matrix = A.toarray()
-
-    # ======================== COMPUTE EDGE DIRECTIONS ========================
-    edge_directions = {}
-    if conn_matrix is not None and (root_cells is not None or end_cells is not None):
-        edge_directions = _compute_vector_directions(
-            conn_matrix, center_labels, root_cells, end_cells
-        )
-
-    fig, ax = plt.subplots(figsize=figsize)
-
-    if show_cells:
-        for g in sorted(pd.unique(cell_df["group"]).tolist()):
-            sub = cell_df[cell_df["group"] == g]
-            ax.scatter(
-                sub["x"], sub["y"],
-                c=[cluster_color_map[g]],
-                s=cell_size,
-                alpha=cell_alpha,
-                linewidths=0,
-                zorder=1,
-            )
-
-    ax.scatter(
-        x_cent, y_cent,
-        s=s_cent,
-        c=center_colors,
-        alpha=0.95,
-        marker="o",
-        edgecolors="k",
-        linewidths=0.6,
-        zorder=5,
-    )
-
-    if show_labels:
-        for xx, yy, lb in zip(x_cent, y_cent, center_labels):
-            ax.text(xx, yy, lb, fontsize=8, color="black", zorder=6)
-
-    target_idx = None
-    if show_vector and conn_matrix is not None:
-        W = conn_matrix. copy()
-
-        dist = None
-        if root_cells is not None or end_cells is not None: 
-            target = (root_cells if root_cells is not None else end_cells)
-            target = str(target).strip()
-            label_to_idx = {lb: i for i, lb in enumerate(center_labels)}
-            if target not in label_to_idx: 
-                raise KeyError(f"Target CMB '{target}' not found among center labels.")
-            target_idx = label_to_idx[target]
-
-            rr, cc = np.where(W > 0)
-            if rr.size == 0:
-                dist = np.full(n_cent, np.inf)
-            else:
-                eps = 1e-12
-                lengths = 1.0 / (W[rr, cc] + eps)
-                G = sp.csr_matrix((lengths, (rr, cc)), shape=(n_cent, n_cent))
-                G = (G + G.T) * 0.5
-                dist = dijkstra(G, directed=False, indices=target_idx)
-
-        V = np.zeros((n_cent, 2), dtype=float)
-        tol = 1e-12
-        for i in range(n_cent):
-            w = W[i]. copy()
-
-            if dist is not None:
-                if not np.isfinite(dist[i]):
-                    w[: ] = 0.0
-                else:
-                    if root_cells is not None: 
-                        keep = np.isfinite(dist) & (dist > dist[i] + tol)
-                    else: 
-                        keep = np.isfinite(dist) & (dist < dist[i] - tol)
-                    w *= keep. astype(float)
-
-            sw = w.sum()
-            if sw > 0:
-                disp = centers_xy - centers_xy[i]
-                V[i] = (w[: , None] * disp).sum(axis=0) / sw
-
-        span_x = float(np.ptp(cell_df["x"]. to_numpy())) if show_cells else float(np.ptp(x_cent))
-        span_y = float(np.ptp(cell_df["y"].to_numpy())) if show_cells else float(np.ptp(y_cent))
-        span = max(span_x, span_y, 1.0)
-
-        mag = np.linalg.norm(V, axis=1)
-        nz = mag > 0
-        if np.any(nz):
-            med = float(np.median(mag[nz]))
-            target_len = vector_span_frac * span
-            scale = (target_len / med) if med > 0 else 1.0
-            Vp = V * scale
-        else:
-            Vp = V
-
-        ax.quiver(
-            x_cent, y_cent,
-            Vp[:, 0], Vp[:, 1],
-            angles="xy", scale_units="xy", scale=1,
-            width=0.003, headwidth=3.5, headlength=4.5,
-            color="black",
-            zorder=7,
-        )
-
-        if target_idx is not None: 
-            ax.scatter(
-                [x_cent[target_idx]], [y_cent[target_idx]],
-                s=float(s_cent[target_idx]) * 1.25,
-                facecolors="none",
-                edgecolors="red",
-                linewidths=1.8,
-                zorder=8,
-            )
-
-    if show_group_legend:
-        groups_for_legend = [g for g in sorted(pd. unique(cell_df["group"]).tolist()) if g != "#UNMAPPED#"]
-        handles = [mpatches.Patch(color=cluster_color_map[g], label=g) for g in groups_for_legend]
-        ax.legend(handles=handles, title="Group", bbox_to_anchor=(1, 1), loc="upper left")
-
-    ax.set_title(title)
-    ax.set_xlabel("Spatial X")
-    ax.set_ylabel("Spatial Y")
-    try:
-        ax.set_aspect(aspect)
-    except Exception: 
-        pass
-
-    plt.tight_layout()
-
-    # ======================== CONNECTIVITY GRAPH ========================
-    fig_conn, ax_conn = None, None
-
-    if plot_conn_graph_by is not None and conn_matrix is not None: 
-        fig_conn, ax_conn = plt.subplots(figsize=conn_graph_figsize)
-
-        if plot_conn_graph_by == "Heatmap":
-            _plot_connectivity_heatmap(
-                ax_conn, conn_matrix, center_labels,
-                sort_labels=heatmap_sort_labels
-            )
-        elif plot_conn_graph_by == "Network":
-            _plot_connectivity_network(
-                ax_conn, conn_matrix, center_labels, center_color_map,
-                node_sizes=s_cent,
-                edge_directions=edge_directions,
-                base_edge_alpha=network_edge_alpha,
-                show_labels=show_labels
-            )
-
-        plt.tight_layout()
-
-    if savepath: 
-        parent = os.path.dirname(savepath)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        fig.savefig(
-            savepath,
-            dpi=dpi,
-            bbox_inches=bbox_inches,
-            transparent=transparent,
-            metadata={"Title": title},
-        )
-
-        if fig_conn is not None:
-            base, ext = os.path.splitext(savepath)
-            conn_savepath = f"{base}_connectivity{ext}"
-            fig_conn.savefig(
-                conn_savepath,
-                dpi=dpi,
-                bbox_inches=bbox_inches,
-                transparent=transparent,
-                metadata={"Title": f"{title} - Connectivity"},
-            )
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-        if fig_conn is not None: 
-            plt.close(fig_conn)
-
-    if plot_conn_graph_by is not None:
-        return (fig, ax), (fig_conn, ax_conn)
-    else:
-        return fig, ax
 
 
 def plot_cmb_conn(
@@ -1924,7 +1390,7 @@ def plot_cmb_conn(
 
     return result
 
-
+"""
 def plot_cmb_vec(
     adata_cmb,
     coor_cell,
@@ -2225,6 +1691,993 @@ def plot_cmb_vec(
         os.makedirs(os.path.dirname(savepath_abs), exist_ok=True)
         fig.savefig(savepath_abs, dpi=dpi, bbox_inches="tight")
     # --------------------------------------------------------
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig, ax
+"""
+
+
+"""
+def plot_cmb_cent_vector_bk(
+    adata,
+    coor,
+    cell_info,
+    group_colors=None,
+    cell_group_col="group",
+    coor_cell_col=None,
+    show_cells=True,
+    cell_alpha=0.3,
+    cell_size=20,
+    size_by_ncells=True,
+    show_labels=True,
+    show_group_legend=False,
+    figsize=(9, 6),
+    aspect="auto",
+    title="CMB centers + connectivity",
+    savepath=None,
+    dpi=300,
+    transparent=False,
+    bbox_inches="tight",
+    show=True,
+    plot_on="Spatial",
+    conn_key="joint_connectivities_sym",
+    top_conn_percentile=0.5,
+    score_key="cmb_snv_ratio_rank_score",
+    arrow_min_delta=None,
+    arrow_min_delta_quantile=0.2,
+    arrow_min_delta_floor=0.0,
+    spatial_max_dist=None,
+    spatial_max_dist_quantile=0.5,
+    edge_color="#555555",
+    edge_lw_min=0.2,
+    edge_lw_max=3.2,
+    edge_alpha_min=0.05,
+    edge_alpha_max=0.95,
+    arrowstyle="-|>",
+    arrow_mutation_scale_min=8,
+    arrow_mutation_scale_max=18,
+    network_layout_seed=42,
+):
+    import os
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.patches import FancyArrowPatch
+    import scipy.sparse as sp
+
+    def _resolve_group_colors(unique_groups, user_colors, fallback_cmap="tab20"):
+        unique_groups = [str(g).strip() for g in unique_groups]
+        n = max(len(unique_groups), 1)
+        default_cols = plt.cm.get_cmap(fallback_cmap)(np.linspace(0, 1, n))
+        default_map = dict(zip(unique_groups, default_cols))
+        if user_colors is None:
+            return default_map
+        if isinstance(user_colors, dict):
+            user_colors = {str(k).strip(): v for k, v in user_colors.items()}
+            return {g: user_colors.get(g, default_map[g]) for g in unique_groups}
+        if isinstance(user_colors, (list, tuple, np.ndarray)):
+            seq = list(user_colors)
+            if len(seq) == 0:
+                return default_map
+            cols = [seq[i % len(seq)] for i in range(len(unique_groups))]
+            return dict(zip(unique_groups, cols))
+        if isinstance(user_colors, str):
+            try:
+                cm = plt.cm.get_cmap(user_colors)
+                cols = cm(np.linspace(0, 1, len(unique_groups)))
+                return dict(zip(unique_groups, cols))
+            except Exception:
+                return default_map
+        return default_map
+
+    def _coor_to_xy_and_cellids(coor_in):
+        if isinstance(coor_in, np.ndarray):
+            if coor_in.ndim != 2 or coor_in.shape[1] < 2:
+                raise ValueError(f"coor ndarray must be (n,>=2); got {coor_in.shape}")
+            raise ValueError("coor ndarray input is not supported because cell IDs are required. Please pass a DataFrame with index as cell IDs or provide coor_cell_col in the DataFrame.")
+        if isinstance(coor_in, pd.DataFrame):
+            df = coor_in.copy()
+            cols_lower = [c.lower() for c in df.columns]
+            if "x" in cols_lower and "y" in cols_lower:
+                xcol = df.columns[cols_lower.index("x")]
+                ycol = df.columns[cols_lower.index("y")]
+                xy = df[[xcol, ycol]].rename(columns={xcol: "x", ycol: "y"})
+            elif "coor_x" in cols_lower and "coor_y" in cols_lower:
+                xcol = df.columns[cols_lower.index("coor_x")]
+                ycol = df.columns[cols_lower.index("coor_y")]
+                xy = df[[xcol, ycol]].rename(columns={xcol: "x", ycol: "y"})
+            else:
+                xy = df.iloc[:, :2].rename(columns={df.columns[0]: "x", df.columns[1]: "y"})
+            if coor_cell_col is not None:
+                if coor_cell_col not in df.columns:
+                    raise KeyError(f"coor_cell_col='{coor_cell_col}' not found in coor columns")
+                cell_ids = df[coor_cell_col].astype(str).str.strip().to_numpy()
+            else:
+                cell_ids = df.index.astype(str).str.strip().to_numpy()
+            xy = xy.reset_index(drop=True)
+            return xy, cell_ids
+        raise TypeError("coor must be a pandas DataFrame (recommended) or numpy array")
+
+    def _cellinfo_to_series(cell_info_in):
+        if isinstance(cell_info_in, pd.Series):
+            s = cell_info_in.copy()
+        elif isinstance(cell_info_in, pd.DataFrame):
+            if cell_group_col in cell_info_in.columns:
+                s = cell_info_in[cell_group_col].copy()
+            elif cell_info_in.shape[1] == 1:
+                s = cell_info_in.iloc[:, 0].copy()
+            else:
+                raise ValueError(f"cell_info has no '{cell_group_col}' and has {cell_info_in.shape[1]} columns")
+        else:
+            raise TypeError("cell_info must be a pandas Series or DataFrame indexed by cell IDs")
+        s.index = s.index.astype(str).str.strip()
+        s = s.astype(str).str.strip()
+        return s
+
+    def _norm01(v, vmin=None, vmax=None):
+        v = np.asarray(v, dtype=float)
+        if v.size == 0:
+            return v
+        if vmin is None:
+            vmin = float(np.min(v))
+        if vmax is None:
+            vmax = float(np.max(v))
+        if vmax <= vmin:
+            return np.zeros_like(v)
+        return (v - vmin) / (vmax - vmin)
+
+    def _node_shrink_pts(node_size_pts2, coef=0.75):
+        s = float(node_size_pts2)
+        if not np.isfinite(s) or s <= 0:
+            return 0.0
+        return float(coef) * float(np.sqrt(s))
+
+    def _clip_segment_by_shrink_pts(ax, p_i, p_j, shrink_i_pts, shrink_j_pts):
+        p_i = np.asarray(p_i, dtype=float)
+        p_j = np.asarray(p_j, dtype=float)
+        if not (np.all(np.isfinite(p_i)) and np.all(np.isfinite(p_j))):
+            return p_i, p_j
+
+        A = ax.transData.transform(p_i)
+        B = ax.transData.transform(p_j)
+        v = B - A
+        dist = float(np.hypot(v[0], v[1]))
+        if dist <= 1e-9:
+            return p_i, p_j
+
+        u = v / dist
+        dpi_fig = float(ax.figure.dpi)
+        shrink_i_px = float(shrink_i_pts) * dpi_fig / 72.0
+        shrink_j_px = float(shrink_j_pts) * dpi_fig / 72.0
+
+        max_each = max(0.0, dist * 0.5 - 1.0)
+        shrink_i_px = min(shrink_i_px, max_each)
+        shrink_j_px = min(shrink_j_px, max_each)
+
+        A2 = A + u * shrink_i_px
+        B2 = B - u * shrink_j_px
+        inv = ax.transData.inverted()
+        pA = inv.transform(A2)
+        pB = inv.transform(B2)
+        return pA, pB
+
+    required_cols = ["x_center", "y_center", "n_cells"]
+    missing = [c for c in required_cols if c not in adata.obs.columns]
+    if missing:
+        raise KeyError(f"Missing columns in adata.obs: {missing}. Expected: {required_cols}")
+
+    plot_on = str(plot_on).strip().capitalize()
+    if plot_on not in {"Spatial", "Network"}:
+        raise ValueError("plot_on must be 'Spatial' or 'Network'")
+
+    if not isinstance(top_conn_percentile, (float, int, np.floating, np.integer)):
+        raise TypeError("top_conn_percentile must be a float in (0,1]")
+    top_conn_percentile = float(top_conn_percentile)
+    if not (0.0 < top_conn_percentile <= 1.0):
+        raise ValueError("top_conn_percentile must be in (0,1]")
+
+    if arrow_min_delta is None:
+        if not (0.0 < float(arrow_min_delta_quantile) < 1.0):
+            raise ValueError("arrow_min_delta_quantile must be in (0,1) when arrow_min_delta is None")
+        arrow_min_delta_floor = float(arrow_min_delta_floor)
+        if arrow_min_delta_floor < 0:
+            raise ValueError("arrow_min_delta_floor must be >= 0")
+    else:
+        if not isinstance(arrow_min_delta, (float, int, np.floating, np.integer)):
+            raise TypeError("arrow_min_delta must be float or None")
+        arrow_min_delta = float(arrow_min_delta)
+        if arrow_min_delta < 0:
+            raise ValueError("arrow_min_delta must be >= 0")
+
+    obs = adata.obs.copy()
+    mask = obs[required_cols].notna().all(axis=1)
+    obs2 = obs.loc[mask, required_cols].astype(float)
+
+    center_labels = adata.obs_names[mask].astype(str).str.strip().to_numpy()
+    x_cent = obs2["x_center"].to_numpy()
+    y_cent = obs2["y_center"].to_numpy()
+    n_cells_cent = obs2["n_cells"].to_numpy()
+    centers_xy = np.column_stack([x_cent, y_cent])
+    n_cent = len(center_labels)
+
+    if size_by_ncells and n_cent > 0:
+        sizes = np.clip(n_cells_cent, 1, None)
+        denom = np.sqrt(sizes.max()) if sizes.max() > 0 else 1.0
+        s_cent = 20 + 180 * (np.sqrt(sizes) / denom)
+    else:
+        s_cent = np.full(n_cent, 160.0, dtype=float)
+
+    center_color_map = _resolve_group_colors(sorted(set(center_labels.tolist())), group_colors, "tab20")
+    center_colors = [center_color_map.get(lb, "#444444") for lb in center_labels]
+
+    if conn_key not in adata.obsp:
+        raise KeyError(f"Cannot find '{conn_key}' in adata.obsp. Available keys: {list(adata.obsp.keys())}")
+    A = adata.obsp[conn_key]
+    if not sp.issparse(A):
+        A = sp.csr_matrix(np.asarray(A))
+    A = A.tocsr()
+
+    idx_cent = np.where(mask.to_numpy() if hasattr(mask, "to_numpy") else np.asarray(mask))[0]
+    A = A[idx_cent][:, idx_cent]
+    if A.shape != (n_cent, n_cent):
+        raise ValueError(f"{conn_key} shape {A.shape} must match centers count ({n_cent},{n_cent})")
+
+    A = (A + A.T) * 0.5
+    A.setdiag(0.0)
+    A.eliminate_zeros()
+    conn = A.toarray().astype(float)
+    np.fill_diagonal(conn, 0.0)
+
+    triu = np.triu_indices(n_cent, k=1)
+    w_all = conn[triu]
+    pos_w = w_all[w_all > 0]
+
+    edges = []
+    if pos_w.size > 0:
+        keep_frac = float(top_conn_percentile)
+        q = 1.0 - keep_frac
+        q = min(max(q, 0.0), 1.0)
+        thr = float(np.quantile(pos_w, q))
+        edges = [
+            (i, j, float(conn[i, j]))
+            for i, j in zip(triu[0], triu[1])
+            if conn[i, j] > 0 and conn[i, j] >= thr
+        ]
+
+    if plot_on == "Spatial" and len(edges) > 0:
+        dists = np.array([np.linalg.norm(centers_xy[i] - centers_xy[j]) for i, j, _ in edges], float)
+        if spatial_max_dist is None:
+            spatial_max_dist = float(np.quantile(dists, spatial_max_dist_quantile)) if dists.size else np.inf
+        edges = [(i, j, w) for (i, j, w), d in zip(edges, dists) if d <= float(spatial_max_dist)]
+
+    score_ok = False
+    score_arr = None
+    if score_key in adata.obs.columns:
+        score_arr_full = adata.obs.loc[adata.obs_names, score_key]
+        score_arr = score_arr_full.loc[adata.obs_names[mask]].astype(float).to_numpy()
+        score_ok = np.all(np.isfinite(score_arr))
+        if not score_ok:
+            print(f"[plot_cmb_cent_vector] WARNING: {score_key} has non finite values, arrows disabled")
+    else:
+        print(f"[plot_cmb_cent_vector] WARNING: {score_key} not found in adata.obs, arrows disabled")
+
+    if arrow_min_delta is None and score_ok and len(edges) > 0:
+        diffs = np.array([abs(float(score_arr[i]) - float(score_arr[j])) for i, j, _ in edges], float)
+        if diffs.size > 0:
+            arrow_min_delta = float(np.quantile(diffs, float(arrow_min_delta_quantile)))
+            arrow_min_delta = max(arrow_min_delta, float(arrow_min_delta_floor))
+        else:
+            arrow_min_delta = float(arrow_min_delta_floor)
+
+    w_sel = np.array([w for _, _, w in edges], float)
+    if w_sel.size > 0:
+        w_n = _norm01(w_sel, float(w_sel.min()), float(w_sel.max()))
+    else:
+        w_n = np.array([], float)
+
+    def _lw_alpha_ms(norm_w):
+        lw = float(edge_lw_min) + float(norm_w) * (float(edge_lw_max) - float(edge_lw_min))
+        al = float(edge_alpha_min) + float(norm_w) * (float(edge_alpha_max) - float(edge_alpha_min))
+        ms = float(arrow_mutation_scale_min) + float(norm_w) * (
+            float(arrow_mutation_scale_max) - float(arrow_mutation_scale_min)
+        )
+        return lw, al, ms
+
+    def _draw_edges_on_ax(ax, pos_arr, node_sizes_pts2):
+        if len(edges) == 0:
+            return
+        for k, (i, j, w) in enumerate(edges):
+            norm_w = float(w_n[k]) if w_n.size else 0.0
+            lw, al, ms = _lw_alpha_ms(norm_w)
+
+            p_i = np.asarray(pos_arr[i], dtype=float)
+            p_j = np.asarray(pos_arr[j], dtype=float)
+
+            shrink_i_pts = _node_shrink_pts(node_sizes_pts2[i])
+            shrink_j_pts = _node_shrink_pts(node_sizes_pts2[j])
+
+            direction = 0
+            if score_ok and arrow_min_delta is not None:
+                di = float(score_arr[i])
+                dj = float(score_arr[j])
+                if abs(di - dj) >= float(arrow_min_delta):
+                    direction = 1 if di > dj else -1
+
+            if direction == 0:
+                start, end = _clip_segment_by_shrink_pts(ax, p_i, p_j, shrink_i_pts, shrink_j_pts)
+                ax.plot(
+                    [start[0], end[0]],
+                    [start[1], end[1]],
+                    color=edge_color,
+                    linewidth=lw,
+                    alpha=al,
+                    zorder=2,
+                )
+            else:
+                if direction > 0:
+                    start, end = p_i, p_j
+                    start_idx, end_idx = i, j
+                else:
+                    start, end = p_j, p_i
+                    start_idx, end_idx = j, i
+
+                shrink_start_pts = _node_shrink_pts(node_sizes_pts2[start_idx])
+                shrink_end_pts = _node_shrink_pts(node_sizes_pts2[end_idx])
+
+                ax.add_patch(
+                    FancyArrowPatch(
+                        posA=(start[0], start[1]),
+                        posB=(end[0], end[1]),
+                        arrowstyle=arrowstyle,
+                        mutation_scale=ms,
+                        color=edge_color,
+                        linewidth=lw,
+                        alpha=al,
+                        shrinkA=shrink_start_pts,
+                        shrinkB=shrink_end_pts,
+                        zorder=2,
+                    )
+                )
+
+    if plot_on == "Network":
+        fig_net, ax_net = plt.subplots(figsize=figsize)
+
+        if n_cent == 0:
+            ax_net.text(0.5, 0.5, "No centers", ha="center", va="center", transform=ax_net.transAxes)
+            ax_net.axis("off")
+        else:
+            try:
+                import networkx as nx
+
+                G = nx.Graph()
+                G.add_nodes_from(range(n_cent))
+                for i, j, w in edges:
+                    G.add_edge(i, j, weight=float(w))
+                if G.number_of_edges() > 0:
+                    pos = nx.spring_layout(G, weight="weight", seed=network_layout_seed)
+                else:
+                    pos = nx.circular_layout(G)
+                pos_arr = np.array([pos[i] for i in range(n_cent)], float)
+            except ImportError:
+                ang = np.linspace(0, 2 * np.pi, n_cent, endpoint=False)
+                pos_arr = np.column_stack([np.cos(ang), np.sin(ang)])
+
+            node_sizes = (120 + 450 * (s_cent / np.max(s_cent))) if np.max(s_cent) > 0 else np.full(n_cent, 300.0)
+
+            _draw_edges_on_ax(ax_net, pos_arr, node_sizes)
+
+            ax_net.scatter(
+                pos_arr[:, 0],
+                pos_arr[:, 1],
+                s=node_sizes,
+                c=center_colors,
+                alpha=0.95,
+                edgecolors="k",
+                linewidths=0.8,
+                zorder=5,
+            )
+
+            if show_labels:
+                for i, lb in enumerate(center_labels):
+                    ax_net.annotate(
+                        str(lb),
+                        xy=(pos_arr[i, 0], pos_arr[i, 1]),
+                        xytext=(5, 5),
+                        textcoords="offset points",
+                        fontsize=8,
+                        color="black",
+                        zorder=6,
+                    )
+
+            ax_net.set_aspect("equal")
+            ax_net.axis("off")
+            ax_net.set_title(title)
+
+        plt.tight_layout()
+
+        if savepath:
+            parent = os.path.dirname(savepath)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            fig_net.savefig(savepath, dpi=dpi, bbox_inches=bbox_inches, transparent=transparent)
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig_net)
+
+        return fig_net, ax_net
+
+    xy_cells, cell_ids = _coor_to_xy_and_cellids(coor)
+    group_series = _cellinfo_to_series(cell_info)
+    groups = group_series.reindex(cell_ids)
+    unmapped_mask = groups.isna()
+    if int(unmapped_mask.sum()) > 0:
+        print(f"[plot_cmb_cent_vector] WARNING: {int(unmapped_mask.sum())} cells in coor not found in cell_info")
+    groups = groups.fillna("#UNMAPPED#").astype(str)
+
+    cell_df = xy_cells.copy()
+    cell_df["group"] = groups.to_numpy()
+    unique_groups = sorted(pd.unique(cell_df["group"]).tolist())
+    cluster_color_map = _resolve_group_colors(unique_groups, group_colors, fallback_cmap="tab20")
+    cluster_color_map["#UNMAPPED#"] = "#999999"
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if show_cells:
+        for g in sorted(pd.unique(cell_df["group"]).tolist()):
+            sub = cell_df[cell_df["group"] == g]
+            ax.scatter(
+                sub["x"],
+                sub["y"],
+                c=[cluster_color_map[g]],
+                s=cell_size,
+                alpha=cell_alpha,
+                linewidths=0,
+                zorder=1,
+            )
+
+    _draw_edges_on_ax(ax, centers_xy, s_cent)
+
+    ax.scatter(
+        x_cent,
+        y_cent,
+        s=s_cent,
+        c=center_colors,
+        alpha=0.95,
+        marker="o",
+        edgecolors="k",
+        linewidths=0.6,
+        zorder=5,
+    )
+
+    if show_labels:
+        for xx, yy, lb in zip(x_cent, y_cent, center_labels):
+            ax.text(xx, yy, lb, fontsize=8, color="black", zorder=6)
+
+    if show_group_legend:
+        groups_for_legend = [g for g in sorted(pd.unique(cell_df["group"]).tolist()) if g != "#UNMAPPED#"]
+        handles = [mpatches.Patch(color=cluster_color_map[g], label=g) for g in groups_for_legend]
+        ax.legend(handles=handles, title="Group", bbox_to_anchor=(1, 1), loc="upper left")
+
+    ax.set_title(title)
+    ax.set_xlabel("Spatial X")
+    ax.set_ylabel("Spatial Y")
+    try:
+        ax.set_aspect(aspect)
+    except Exception:
+        pass
+    plt.tight_layout()
+
+    if savepath:
+        parent = os.path.dirname(savepath)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fig.savefig(savepath, dpi=dpi, bbox_inches=bbox_inches, transparent=transparent)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return fig, ax
+"""
+
+def plot_cmb_cent_vector(
+    adata,
+    coor,
+    cell_info,
+    group_colors=None,
+    cell_group_col="group",
+    coor_cell_col=None,
+    show_cells=True,
+    cell_alpha=0.3,
+    cell_size=20,
+    size_by_ncells=True,
+    show_labels=True,
+    show_group_legend=False,
+    figsize=(9, 6),
+    aspect="auto",
+    title="CMB centers + connectivity",
+    savepath=None,
+    dpi=300,
+    transparent=False,
+    bbox_inches="tight",
+    show=True,
+    plot_on="Spatial",
+    conn_key="joint_connectivities_sym",
+    top_conn_percentile=0.5,
+    score_key="cmb_snv_ratio_rank_score",
+    arrow_min_delta=None,
+    arrow_min_delta_quantile=0.2,
+    arrow_min_delta_floor=0.0,
+    spatial_max_dist=None,
+    spatial_max_dist_quantile=0.5,
+    edge_color="#555555",
+    edge_lw_min=0.2,
+    edge_lw_max=3.2,
+    edge_alpha_min=0.05,
+    edge_alpha_max=0.95,
+    arrowstyle="-|>",
+    arrow_mutation_scale_min=8,
+    arrow_mutation_scale_max=18,
+    network_layout_seed=42,
+):
+    import os
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.patches import FancyArrowPatch
+    import scipy.sparse as sp
+
+    def _resolve_group_colors(unique_groups, user_colors, fallback_cmap="tab20"):
+        unique_groups = [str(g).strip() for g in unique_groups]
+        n = max(len(unique_groups), 1)
+        default_cols = plt.cm.get_cmap(fallback_cmap)(np.linspace(0, 1, n))
+        default_map = dict(zip(unique_groups, default_cols))
+        if user_colors is None:
+            return default_map
+        if isinstance(user_colors, dict):
+            user_colors = {str(k).strip(): v for k, v in user_colors.items()}
+            return {g: user_colors.get(g, default_map[g]) for g in unique_groups}
+        if isinstance(user_colors, (list, tuple, np.ndarray)):
+            seq = list(user_colors)
+            if len(seq) == 0:
+                return default_map
+            cols = [seq[i % len(seq)] for i in range(len(unique_groups))]
+            return dict(zip(unique_groups, cols))
+        if isinstance(user_colors, str):
+            try:
+                cm = plt.cm.get_cmap(user_colors)
+                cols = cm(np.linspace(0, 1, len(unique_groups)))
+                return dict(zip(unique_groups, cols))
+            except Exception:
+                return default_map
+        return default_map
+
+    def _coor_to_xy_and_cellids(coor_in):
+        if isinstance(coor_in, np.ndarray):
+            if coor_in.ndim != 2 or coor_in.shape[1] < 2:
+                raise ValueError(f"coor ndarray must be (n,>=2); got {coor_in.shape}")
+            raise ValueError("coor ndarray input is not supported because cell IDs are required. Please pass a DataFrame with index as cell IDs or provide coor_cell_col in the DataFrame.")
+        if isinstance(coor_in, pd.DataFrame):
+            df = coor_in.copy()
+            cols_lower = [c.lower() for c in df.columns]
+            if "x" in cols_lower and "y" in cols_lower:
+                xcol = df.columns[cols_lower.index("x")]
+                ycol = df.columns[cols_lower.index("y")]
+                xy = df[[xcol, ycol]].rename(columns={xcol: "x", ycol: "y"})
+            elif "coor_x" in cols_lower and "coor_y" in cols_lower:
+                xcol = df.columns[cols_lower.index("coor_x")]
+                ycol = df.columns[cols_lower.index("coor_y")]
+                xy = df[[xcol, ycol]].rename(columns={xcol: "x", ycol: "y"})
+            else:
+                xy = df.iloc[:, :2].rename(columns={df.columns[0]: "x", df.columns[1]: "y"})
+            if coor_cell_col is not None:
+                if coor_cell_col not in df.columns:
+                    raise KeyError(f"coor_cell_col='{coor_cell_col}' not found in coor columns")
+                cell_ids = df[coor_cell_col].astype(str).str.strip().to_numpy()
+            else:
+                cell_ids = df.index.astype(str).str.strip().to_numpy()
+            xy = xy.reset_index(drop=True)
+            return xy, cell_ids
+        raise TypeError("coor must be a pandas DataFrame (recommended) or numpy array")
+
+    def _cellinfo_to_series(cell_info_in):
+        if isinstance(cell_info_in, pd.Series):
+            s = cell_info_in.copy()
+        elif isinstance(cell_info_in, pd.DataFrame):
+            if cell_group_col in cell_info_in.columns:
+                s = cell_info_in[cell_group_col].copy()
+            elif cell_info_in.shape[1] == 1:
+                s = cell_info_in.iloc[:, 0].copy()
+            else:
+                raise ValueError(f"cell_info has no '{cell_group_col}' and has {cell_info_in.shape[1]} columns")
+        else:
+            raise TypeError("cell_info must be a pandas Series or DataFrame indexed by cell IDs")
+        s.index = s.index.astype(str).str.strip()
+        s = s.astype(str).str.strip()
+        return s
+
+    def _norm01(v, vmin=None, vmax=None):
+        v = np.asarray(v, dtype=float)
+        if v.size == 0:
+            return v
+        if vmin is None:
+            vmin = float(np.min(v))
+        if vmax is None:
+            vmax = float(np.max(v))
+        if vmax <= vmin:
+            return np.zeros_like(v)
+        return (v - vmin) / (vmax - vmin)
+
+    def _node_shrink_pts(node_size_pts2, coef=0.75):
+        s = float(node_size_pts2)
+        if not np.isfinite(s) or s <= 0:
+            return 0.0
+        return float(coef) * float(np.sqrt(s))
+
+    def _clip_segment_by_shrink_pts(ax, p_i, p_j, shrink_i_pts, shrink_j_pts):
+        p_i = np.asarray(p_i, dtype=float)
+        p_j = np.asarray(p_j, dtype=float)
+        if not (np.all(np.isfinite(p_i)) and np.all(np.isfinite(p_j))):
+            return p_i, p_j
+
+        A = ax.transData.transform(p_i)
+        B = ax.transData.transform(p_j)
+        v = B - A
+        dist = float(np.hypot(v[0], v[1]))
+        if dist <= 1e-9:
+            return p_i, p_j
+
+        u = v / dist
+        dpi_fig = float(ax.figure.dpi)
+        shrink_i_px = float(shrink_i_pts) * dpi_fig / 72.0
+        shrink_j_px = float(shrink_j_pts) * dpi_fig / 72.0
+
+        max_each = max(0.0, dist * 0.5 - 1.0)
+        shrink_i_px = min(shrink_i_px, max_each)
+        shrink_j_px = min(shrink_j_px, max_each)
+
+        A2 = A + u * shrink_i_px
+        B2 = B - u * shrink_j_px
+        inv = ax.transData.inverted()
+        pA = inv.transform(A2)
+        pB = inv.transform(B2)
+        return pA, pB
+
+    required_cols = ["x_center", "y_center", "n_cells"]
+    missing = [c for c in required_cols if c not in adata.obs.columns]
+    if missing:
+        raise KeyError(f"Missing columns in adata.obs: {missing}. Expected: {required_cols}")
+
+    plot_on = str(plot_on).strip().capitalize()
+    if plot_on not in {"Spatial", "Network"}:
+        raise ValueError("plot_on must be 'Spatial' or 'Network'")
+
+    if not isinstance(top_conn_percentile, (float, int, np.floating, np.integer)):
+        raise TypeError("top_conn_percentile must be a float in (0,1]")
+    top_conn_percentile = float(top_conn_percentile)
+    if not (0.0 < top_conn_percentile <= 1.0):
+        raise ValueError("top_conn_percentile must be in (0,1]")
+
+    if arrow_min_delta is None:
+        if not (0.0 < float(arrow_min_delta_quantile) < 1.0):
+            raise ValueError("arrow_min_delta_quantile must be in (0,1) when arrow_min_delta is None")
+        arrow_min_delta_floor = float(arrow_min_delta_floor)
+        if arrow_min_delta_floor < 0:
+            raise ValueError("arrow_min_delta_floor must be >= 0")
+    else:
+        if not isinstance(arrow_min_delta, (float, int, np.floating, np.integer)):
+            raise TypeError("arrow_min_delta must be float or None")
+        arrow_min_delta = float(arrow_min_delta)
+        if arrow_min_delta < 0:
+            raise ValueError("arrow_min_delta must be >= 0")
+
+    obs = adata.obs.copy()
+    mask = obs[required_cols].notna().all(axis=1)
+    obs2 = obs.loc[mask, required_cols].astype(float)
+
+    center_labels = adata.obs_names[mask].astype(str).str.strip().to_numpy()
+    x_cent = obs2["x_center"].to_numpy()
+    y_cent = obs2["y_center"].to_numpy()
+    n_cells_cent = obs2["n_cells"].to_numpy()
+    centers_xy = np.column_stack([x_cent, y_cent])
+    n_cent = len(center_labels)
+
+    if size_by_ncells and n_cent > 0:
+        sizes = np.clip(n_cells_cent, 1, None)
+        denom = np.sqrt(sizes.max()) if sizes.max() > 0 else 1.0
+        s_cent = 20 + 180 * (np.sqrt(sizes) / denom)
+    else:
+        s_cent = np.full(n_cent, 160.0, dtype=float)
+
+    center_color_map = _resolve_group_colors(sorted(set(center_labels.tolist())), group_colors, "tab20")
+    center_colors = [center_color_map.get(lb, "#444444") for lb in center_labels]
+
+    if conn_key not in adata.obsp:
+        raise KeyError(f"Cannot find '{conn_key}' in adata.obsp. Available keys: {list(adata.obsp.keys())}")
+    A = adata.obsp[conn_key]
+    if not sp.issparse(A):
+        A = sp.csr_matrix(np.asarray(A))
+    A = A.tocsr()
+
+    idx_cent = np.where(mask.to_numpy() if hasattr(mask, "to_numpy") else np.asarray(mask))[0]
+    A = A[idx_cent][:, idx_cent]
+    if A.shape != (n_cent, n_cent):
+        raise ValueError(f"{conn_key} shape {A.shape} must match centers count ({n_cent},{n_cent})")
+
+    A = (A + A.T) * 0.5
+    A.setdiag(0.0)
+    A.eliminate_zeros()
+    conn = A.toarray().astype(float)
+    np.fill_diagonal(conn, 0.0)
+
+    triu = np.triu_indices(n_cent, k=1)
+    w_all = conn[triu]
+    pos_w = w_all[w_all > 0]
+
+    edges_all = []
+    if pos_w.size > 0:
+        keep_frac = float(top_conn_percentile)
+        q = 1.0 - keep_frac
+        q = min(max(q, 0.0), 1.0)
+        thr = float(np.quantile(pos_w, q))
+        edges_all = [
+            (i, j, float(conn[i, j]))
+            for i, j in zip(triu[0], triu[1])
+            if conn[i, j] > 0 and conn[i, j] >= thr
+        ]
+
+    score_ok = False
+    score_arr = None
+    if score_key in adata.obs.columns:
+        score_arr_full = adata.obs.loc[adata.obs_names, score_key]
+        score_arr = score_arr_full.loc[adata.obs_names[mask]].astype(float).to_numpy()
+        score_ok = np.all(np.isfinite(score_arr))
+        if not score_ok:
+            print(f"[plot_cmb_cent_vector] WARNING: {score_key} has non finite values, arrows disabled")
+    else:
+        print(f"[plot_cmb_cent_vector] WARNING: {score_key} not found in adata.obs, arrows disabled")
+
+    w_sel_all = np.array([w for _, _, w in edges_all], float)
+    if w_sel_all.size > 0:
+        w_n_all = _norm01(w_sel_all, float(w_sel_all.min()), float(w_sel_all.max()))
+    else:
+        w_n_all = np.array([], float)
+
+    if arrow_min_delta is None and score_ok and len(edges_all) > 0:
+        diffs_all = np.array([abs(float(score_arr[i]) - float(score_arr[j])) for i, j, _ in edges_all], float)
+        if diffs_all.size > 0:
+            arrow_min_delta = float(np.quantile(diffs_all, float(arrow_min_delta_quantile)))
+            arrow_min_delta = max(arrow_min_delta, float(arrow_min_delta_floor))
+        else:
+            arrow_min_delta = float(arrow_min_delta_floor)
+
+    edges = edges_all
+    w_n = w_n_all
+
+    if plot_on == "Spatial" and len(edges_all) > 0:
+        dists_all = np.array([np.linalg.norm(centers_xy[i] - centers_xy[j]) for i, j, _ in edges_all], float)
+        if spatial_max_dist is None:
+            spatial_max_dist = float(np.quantile(dists_all, spatial_max_dist_quantile)) if dists_all.size else np.inf
+        spatial_max_dist = float(spatial_max_dist)
+        keep_idx = np.where(dists_all <= spatial_max_dist)[0]
+        edges = [edges_all[k] for k in keep_idx.tolist()]
+        w_n = w_n_all[keep_idx] if w_n_all.size else np.array([], float)
+
+    def _lw_alpha_ms(norm_w):
+        lw = float(edge_lw_min) + float(norm_w) * (float(edge_lw_max) - float(edge_lw_min))
+        al = float(edge_alpha_min) + float(norm_w) * (float(edge_alpha_max) - float(edge_alpha_min))
+        ms = float(arrow_mutation_scale_min) + float(norm_w) * (
+            float(arrow_mutation_scale_max) - float(arrow_mutation_scale_min)
+        )
+        return lw, al, ms
+
+    def _draw_edges_on_ax(ax, pos_arr, node_sizes_pts2):
+        if len(edges) == 0:
+            return
+        for k, (i, j, w) in enumerate(edges):
+            norm_w = float(w_n[k]) if w_n.size else 0.0
+            lw, al, ms = _lw_alpha_ms(norm_w)
+
+            p_i = np.asarray(pos_arr[i], dtype=float)
+            p_j = np.asarray(pos_arr[j], dtype=float)
+
+            shrink_i_pts = _node_shrink_pts(node_sizes_pts2[i])
+            shrink_j_pts = _node_shrink_pts(node_sizes_pts2[j])
+
+            direction = 0
+            if score_ok and arrow_min_delta is not None:
+                di = float(score_arr[i])
+                dj = float(score_arr[j])
+                if abs(di - dj) >= float(arrow_min_delta):
+                    direction = 1 if di > dj else -1
+
+            if direction == 0:
+                start, end = _clip_segment_by_shrink_pts(ax, p_i, p_j, shrink_i_pts, shrink_j_pts)
+                ax.plot(
+                    [start[0], end[0]],
+                    [start[1], end[1]],
+                    color=edge_color,
+                    linewidth=lw,
+                    alpha=al,
+                    zorder=2,
+                )
+            else:
+                if direction > 0:
+                    start, end = p_i, p_j
+                    start_idx, end_idx = i, j
+                else:
+                    start, end = p_j, p_i
+                    start_idx, end_idx = j, i
+
+                shrink_start_pts = _node_shrink_pts(node_sizes_pts2[start_idx])
+                shrink_end_pts = _node_shrink_pts(node_sizes_pts2[end_idx])
+
+                ax.add_patch(
+                    FancyArrowPatch(
+                        posA=(start[0], start[1]),
+                        posB=(end[0], end[1]),
+                        arrowstyle=arrowstyle,
+                        mutation_scale=ms,
+                        color=edge_color,
+                        linewidth=lw,
+                        alpha=al,
+                        shrinkA=shrink_start_pts,
+                        shrinkB=shrink_end_pts,
+                        zorder=2,
+                    )
+                )
+
+    if plot_on == "Network":
+        fig_net, ax_net = plt.subplots(figsize=figsize)
+
+        if n_cent == 0:
+            ax_net.text(0.5, 0.5, "No centers", ha="center", va="center", transform=ax_net.transAxes)
+            ax_net.axis("off")
+        else:
+            try:
+                import networkx as nx
+                G = nx.Graph()
+                G.add_nodes_from(range(n_cent))
+                for i, j, w in edges:
+                    G.add_edge(i, j, weight=float(w))
+                if G.number_of_edges() > 0:
+                    pos = nx.spring_layout(G, weight=None, seed=network_layout_seed)
+                else:
+                    pos = nx.circular_layout(G)
+                pos_arr = np.array([pos[i] for i in range(n_cent)], float)
+            except ImportError:
+                ang = np.linspace(0, 2 * np.pi, n_cent, endpoint=False)
+                pos_arr = np.column_stack([np.cos(ang), np.sin(ang)])
+
+            if pos_arr.size:
+                pos_arr = pos_arr - pos_arr.mean(axis=0, keepdims=True)
+                rx = float(pos_arr[:, 0].max() - pos_arr[:, 0].min())
+                ry = float(pos_arr[:, 1].max() - pos_arr[:, 1].min())
+                if rx > 0 and ry > 0:
+                    pos_arr[:, 0] /= rx
+                    pos_arr[:, 1] /= ry
+
+            node_sizes = (120 + 450 * (s_cent / np.max(s_cent))) if np.max(s_cent) > 0 else np.full(n_cent, 300.0)
+
+            _draw_edges_on_ax(ax_net, pos_arr, node_sizes)
+
+            ax_net.scatter(
+                pos_arr[:, 0],
+                pos_arr[:, 1],
+                s=node_sizes,
+                c=center_colors,
+                alpha=0.95,
+                edgecolors="k",
+                linewidths=0.8,
+                zorder=5,
+            )
+
+            if show_labels:
+                for i, lb in enumerate(center_labels):
+                    ax_net.annotate(
+                        str(lb),
+                        xy=(pos_arr[i, 0], pos_arr[i, 1]),
+                        xytext=(5, 5),
+                        textcoords="offset points",
+                        fontsize=8,
+                        color="black",
+                        zorder=6,
+                    )
+
+            ax_net.set_aspect("equal")
+            ax_net.axis("off")
+            ax_net.set_title(title)
+
+        plt.tight_layout()
+
+        if savepath:
+            parent = os.path.dirname(savepath)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            fig_net.savefig(savepath, dpi=dpi, bbox_inches=bbox_inches, transparent=transparent)
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig_net)
+
+        return fig_net, ax_net
+
+    xy_cells, cell_ids = _coor_to_xy_and_cellids(coor)
+    group_series = _cellinfo_to_series(cell_info)
+    groups = group_series.reindex(cell_ids)
+    unmapped_mask = groups.isna()
+    if int(unmapped_mask.sum()) > 0:
+        print(f"[plot_cmb_cent_vector] WARNING: {int(unmapped_mask.sum())} cells in coor not found in cell_info")
+    groups = groups.fillna("#UNMAPPED#").astype(str)
+
+    cell_df = xy_cells.copy()
+    cell_df["group"] = groups.to_numpy()
+    unique_groups = sorted(pd.unique(cell_df["group"]).tolist())
+    cluster_color_map = _resolve_group_colors(unique_groups, group_colors, fallback_cmap="tab20")
+    cluster_color_map["#UNMAPPED#"] = "#999999"
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if show_cells:
+        for g in sorted(pd.unique(cell_df["group"]).tolist()):
+            sub = cell_df[cell_df["group"] == g]
+            ax.scatter(
+                sub["x"],
+                sub["y"],
+                c=[cluster_color_map[g]],
+                s=cell_size,
+                alpha=cell_alpha,
+                linewidths=0,
+                zorder=1,
+            )
+
+    _draw_edges_on_ax(ax, centers_xy, s_cent)
+
+    ax.scatter(
+        x_cent,
+        y_cent,
+        s=s_cent,
+        c=center_colors,
+        alpha=0.95,
+        marker="o",
+        edgecolors="k",
+        linewidths=0.6,
+        zorder=5,
+    )
+
+    if show_labels:
+        for xx, yy, lb in zip(x_cent, y_cent, center_labels):
+            ax.text(xx, yy, lb, fontsize=8, color="black", zorder=6)
+
+    if show_group_legend:
+        groups_for_legend = [g for g in sorted(pd.unique(cell_df["group"]).tolist()) if g != "#UNMAPPED#"]
+        handles = [mpatches.Patch(color=cluster_color_map[g], label=g) for g in groups_for_legend]
+        ax.legend(handles=handles, title="Group", bbox_to_anchor=(1, 1), loc="upper left")
+
+    ax.set_title(title)
+    ax.set_xlabel("Spatial X")
+    ax.set_ylabel("Spatial Y")
+    try:
+        ax.set_aspect(aspect)
+    except Exception:
+        pass
+    plt.tight_layout()
+
+    if savepath:
+        parent = os.path.dirname(savepath)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fig.savefig(savepath, dpi=dpi, bbox_inches=bbox_inches, transparent=transparent)
 
     if show:
         plt.show()
