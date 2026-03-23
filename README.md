@@ -24,7 +24,7 @@ Create a conda environment that contains the dependencies required to run LineMu
 
 ``` bash
 cd linemut/
-conda create -n linemut -f ./conda_env.txt 
+conda create -n linemut_env --file ./conda_env.txt
 ```
 
 LineMut also depends on GATK, so please ensure that GATK is already installed. You can verify the installation using the following command:  
@@ -90,5 +90,9 @@ linemut_call [OPTIONS]
 Refer to the [linemut-tutorial](https://ruiyingchenbioinfo.github.io/LineMut_tutorialv0.1.0/) page for more detailed information.
 
 
+<details> <summary> Note about package development </summary>
 
+LineMut is actively being developed. You may occasionally encounter bugs or minor documentation issues. GitHub issues are welcome for bug reports, usage questions, and feature suggestions.
+
+</details>
 
