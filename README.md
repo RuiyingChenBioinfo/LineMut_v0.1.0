@@ -27,7 +27,7 @@ cd linemut/
 conda create -n linemut_env --file ./conda_env.txt
 ```
 
-LineMut also depends on GATK, so please ensure that GATK is already installed. You can verify the installation using the following command:  
+LineMut also depends on [GATK4](https://gatk.broadinstitute.org/hc/en-us), so please ensure that GATK4 is already installed. You can verify the installation using the following command:  
 
 ``` bash
 gatk --version 
